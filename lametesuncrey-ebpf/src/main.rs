@@ -2,13 +2,16 @@
 #![no_main]
 
 use aya_ebpf::bindings::{BPF_ANY, BPF_RB_FORCE_WAKEUP, BPF_RB_NO_WAKEUP};
-use aya_ebpf::helpers::generated::bpf_ktime_get_ns;
+use aya_ebpf::helpers::{bpf_probe_read_kernel, generated::bpf_ktime_get_ns};
 use aya_ebpf::macros::{kprobe, map, tracepoint};
 use aya_ebpf::maps::RingBuf;
 use aya_ebpf::{
     maps::HashMap,
     programs::{ProbeContext, TracePointContext},
 };
+use lametesuncrey_ebpf::bindings::vmlinux::sk_buff;
+use network_types::ip::IpProto;
+use network_types::{ip::Ipv4Hdr, udp::UdpHdr};
 
 #[map(name = "TX_TIME_MAP")]
 static TX_TIME_MAP: HashMap<u64, u64> = HashMap::with_max_entries(65536, 0);
@@ -16,6 +19,7 @@ static TX_TIME_MAP: HashMap<u64, u64> = HashMap::with_max_entries(65536, 0);
 static LATENCY_ARRAY: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
 
 static BATCH_SIZE: u64 = 5000;
+static CLIENT_PORT: u16 = 14000;
 
 static mut EVENT_COUNTER: u64 = 0;
 
@@ -29,9 +33,34 @@ pub fn trace_netif_receive_skb(ctx: TracePointContext) -> u32 {
 
 #[inline(always)]
 fn try_trace_netif_receive_skb(ctx: TracePointContext) -> Result<u32, u32> {
-    let skbaddr: u64 = unsafe { ctx.read_at(8).map_err(|c| c as u32)? };
-    let time: u64 = unsafe { bpf_ktime_get_ns() };
-    let _ = TX_TIME_MAP.insert(skbaddr, time, BPF_ANY.into());
+    let skb_addr: *const sk_buff = unsafe { ctx.read_at(8).map_err(|c| c as u32)? };
+    let data_len =
+        unsafe { bpf_probe_read_kernel(&raw const (*skb_addr).data_len).map_err(|c| c as u32)? };
+
+    // skip non-linear packet
+    if data_len > 0 {
+        return Ok(0);
+    }
+
+    let data_ptr =
+        unsafe { bpf_probe_read_kernel(&raw const (*skb_addr).data).map_err(|c| c as u32)? }
+            as usize;
+
+    let ip_hdr: Ipv4Hdr =
+        unsafe { bpf_probe_read_kernel(data_ptr as *const Ipv4Hdr).map_err(|c| c as u32)? };
+    if ip_hdr.proto != IpProto::Udp.into() {
+        return Ok(0);
+    }
+
+    let udp_hdr: UdpHdr = unsafe {
+        bpf_probe_read_kernel(&*((data_ptr + Ipv4Hdr::LEN) as *const UdpHdr))
+            .map_err(|c| c as u32)?
+    };
+    if udp_hdr.src_port() == CLIENT_PORT {
+        let time: u64 = unsafe { bpf_ktime_get_ns() };
+        let _ = TX_TIME_MAP.insert(skb_addr as u64, time, BPF_ANY.into());
+    }
+
     Ok(0)
 }
 
