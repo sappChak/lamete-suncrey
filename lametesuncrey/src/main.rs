@@ -12,7 +12,7 @@ use tokio::{io::unix::AsyncFd, signal, sync::mpsc};
 #[derive(Debug, Parser)]
 struct Args {
     /// Number of latency measurements
-    #[arg(short, long, default_value_t = 10_00_00)]
+    #[arg(short, long, default_value_t = 100_000)]
     count: usize,
 }
 
@@ -81,11 +81,26 @@ async fn main() -> anyhow::Result<()> {
     });
 
     tokio::spawn(async move {
-        while let Some(item) = rx.recv().await {
-            if !item.is_empty() {
-                let sum: u64 = item.iter().sum();
-                let avg_latency = sum / item.len() as u64;
-                info!("average latency: {avg_latency} ns");
+        let mut counter = 0;
+        while let Some(batch) = rx.recv().await {
+            if !batch.is_empty() {
+                let n = batch.len() as u64;
+                let sum: u64 = batch.iter().sum();
+                let mean = sum as f64 / n as f64;
+                let sample_variance = batch
+                    .iter()
+                    .map(|&x| {
+                        let diff = x as f64 - mean;
+                        diff * diff
+                    })
+                    .sum::<f64>()
+                    / (n as f64 - 1.0);
+                let std_dev = sample_variance.sqrt();
+                info!(
+                    "{counter}: batch size: {n}; sample mean: {:.3} ns; std-dev: {:.3} ns",
+                    mean, std_dev
+                );
+                counter += 1;
             }
         }
     });
